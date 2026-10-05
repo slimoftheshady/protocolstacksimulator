@@ -7,6 +7,7 @@ Part b): IPv6 layer + RPL (DIO) topology construction
 import ipaddress
 import struct
 from collections import deque
+from typing import Dict, List, Optional, Set
 
 # ---------------------------------------------------------------- constants
 BROADCAST_MAC = "FF:FF:FF:FF"
@@ -54,7 +55,7 @@ def fmt_rank(rank: int) -> str:
     return "infinity" if rank == INFINITE_RANK else str(rank)
 
 
-def log(node, proto, op, msg=""):
+def log(node, proto: str, op: str, msg: str = "") -> None:
     """Uniform log line: [Node X][PROTOCOL][OPERATION] message"""
     name = node.name if hasattr(node, "name") else str(node)
     print(f"[Node {name}][{proto}][{op}] {msg}")
@@ -68,21 +69,22 @@ class Channel:
     Frames are queued and delivered in transmission order, so the log shows
     each node finishing its processing before the next frame is delivered."""
 
-    def __init__(self):
-        self.nodes = {}          # name -> Node
-        self.queue = deque()
-        self.delivering = False
+    def __init__(self) -> None:
+        self.nodes: Dict[str, "Node"] = {}
+        self.queue: deque = deque()
+        self.delivering: bool = False
 
-    def register(self, node):
+    def register(self, node: "Node") -> None:
         self.nodes[node.name] = node
 
     def name_of_ipv6(self, ip: str) -> str:
+        ip_obj = ipaddress.IPv6Address(ip)
         for n in self.nodes.values():
-            if ipaddress.IPv6Address(n.ipv6) == ipaddress.IPv6Address(ip):
+            if n.ipv6_obj == ip_obj:
                 return n.name
         return ip
 
-    def transmit(self, sender, frame: bytes):
+    def transmit(self, sender: "Node", frame: bytes) -> None:
         self.queue.append((sender, frame))
         if self.delivering:
             return
@@ -99,43 +101,68 @@ class Channel:
 
 # ---------------------------------------------------------------- node
 class Node:
-    def __init__(self, name, mac, ipv6, neighbors, channel, is_root=False, has_wired=False):
+    def __init__(
+        self,
+        name: str,
+        mac: str,
+        ipv6: str,
+        neighbors: List[str],
+        channel: Channel,
+        is_root: bool = False,
+        has_wired: bool = False,
+    ) -> None:
         self.name = name
         self.mac = mac
+        self.mac_bytes = mac_to_bytes(mac)
         self.ipv6 = ipv6
+        self.ipv6_obj = ipaddress.IPv6Address(ipv6)
+        self.ipv6_bytes = ip_to_bytes(ipv6)
         self.neighbors = neighbors              # one-hop neighbour names
         self.channel = channel
         self.has_wired = has_wired              # only root A has a wired interface
         self.mac_seq = 0                        # MAC sequence number
-        self.pending_acks = set()               # seq numbers awaiting a MAC ACK
+        self.pending_acks: Set[int] = set()     # seq numbers awaiting a MAC ACK
         # RPL state
         self.is_root = is_root
         self.rank = 0 if is_root else INFINITE_RANK
-        self.preferred_parent = None            # parent node name (None = unknown)
-        self.parent_mac = None
-        self.parent_ipv6 = None
-        # Added in later parts: UDP/CoAP/IPsec/DTLS state, routing table, ...
+        self.preferred_parent: Optional[str] = None
+        self.parent_mac: Optional[str] = None
+        self.parent_ipv6: Optional[str] = None
         channel.register(self)
 
-    def setup(self):
-        log(self, "NODE", "INIT",
+    def setup(self) -> None:
+        log(
+            self,
+            "NODE",
+            "INIT",
             f"Initialized: name={self.name}, MAC={self.mac}, IPv6={self.ipv6}"
             + (", interfaces=[802.15.4 wireless, wired (Internet)]" if self.has_wired else "")
-            + f", RPL Rank={fmt_rank(self.rank)}, Preferred Parent={self.preferred_parent}")
+            + f", RPL Rank={fmt_rank(self.rank)}, Preferred Parent={self.preferred_parent}",
+        )
 
     # ============================================================ MAC layer
-    def send_mac(self, dst_mac, frame_type, payload: bytes, seq=None):
+    def send_mac(self, dst_mac: str, frame_type: int, payload: bytes, seq: Optional[int] = None) -> None:
         """Build MAC header, encapsulate payload, hand frame to the channel."""
         if seq is None:
             seq = self.mac_seq
             self.mac_seq = (self.mac_seq + 1) % 256
-        header = struct.pack(MAC_HEADER_FMT, mac_to_bytes(self.mac), mac_to_bytes(dst_mac),
-                             seq, frame_type, len(payload))
+        header = struct.pack(
+            MAC_HEADER_FMT,
+            self.mac_bytes,
+            mac_to_bytes(dst_mac),
+            seq,
+            frame_type,
+            len(payload),
+        )
         frame = header + payload
         ftype = FRAME_NAMES[frame_type]
-        log(self, "MAC", "CREATE",
+        log(
+            self,
+            "MAC",
+            "CREATE",
             f"{ftype} frame: src={self.mac}, dst={dst_mac}, seq={seq}, "
-            f"type={frame_type}, payload_len={len(payload)}, total={len(frame)} bytes")
+            f"type={frame_type}, payload_len={len(payload)}, total={len(frame)} bytes",
+        )
         log(self, "MAC", "ENCAPSULATE", f"MAC header ({MAC_HEADER_LEN} B) + MAC payload ({len(payload)} B)")
         if frame_type == FRAME_DATA and dst_mac != BROADCAST_MAC:
             self.pending_acks.add(seq)
@@ -145,15 +172,19 @@ class Node:
             log(self, "MAC", "TRANSMIT", f"Sending unicast {ftype} frame: Destination MAC={dst_mac} (seq={seq})")
         self.channel.transmit(self, frame)
 
-    def receive_mac(self, frame: bytes):
+    def receive_mac(self, frame: bytes) -> None:
         """Parse MAC header, process frame type, pass MAC payload to IPv6."""
         src_b, dst_b, seq, ftype, plen = struct.unpack(MAC_HEADER_FMT, frame[:MAC_HEADER_LEN])
         src, dst = bytes_to_mac(src_b), bytes_to_mac(dst_b)
         payload = frame[MAC_HEADER_LEN:MAC_HEADER_LEN + plen]
         name = FRAME_NAMES.get(ftype, "UNKNOWN")
         log(self, "MAC", "RECEIVE", f"Received {name} frame from MAC={src} ({len(frame)} bytes)")
-        log(self, "MAC", "PARSE",
-            f"src={src}, dst={dst}, seq={seq}, type={ftype}({name}), payload_len={plen}")
+        log(
+            self,
+            "MAC",
+            "PARSE",
+            f"src={src}, dst={dst}, seq={seq}, type={ftype}({name}), payload_len={plen}",
+        )
 
         if dst != self.mac and dst != BROADCAST_MAC:
             log(self, "MAC", "DROP", f"Frame not addressed to {self.mac}; discarded")
@@ -177,23 +208,31 @@ class Node:
         self.receive_ipv6(payload, src)
 
     # ========================================================== IPv6 layer
-    def send_ipv6(self, dst_ipv6, next_header, payload: bytes, next_hop_mac):
+    def send_ipv6(self, dst_ipv6: str, next_header: int, payload: bytes, next_hop_mac: str) -> None:
         """Build IPv6 header, encapsulate the payload, pass the packet to MAC."""
-        header = struct.pack(IPV6_HEADER_FMT, ip_to_bytes(self.ipv6), ip_to_bytes(dst_ipv6),
-                             next_header, len(payload))
+        header = struct.pack(
+            IPV6_HEADER_FMT,
+            self.ipv6_bytes,
+            ip_to_bytes(dst_ipv6),
+            next_header,
+            len(payload),
+        )
         packet = header + payload
         nh_name = NH_NAMES.get(next_header, str(next_header))
-        log(self, "IPv6", "CREATE",
+        log(
+            self,
+            "IPv6",
+            "CREATE",
             f"IPv6 header: src={self.ipv6}, dst={dst_ipv6}, Next Header={next_header} ({nh_name}), "
-            f"payload_len={len(payload)}, total={len(packet)} bytes")
+            f"payload_len={len(payload)}, total={len(packet)} bytes",
+        )
         what = "RPL message" if next_header == NH_ICMPV6 else "payload"
-        log(self, "IPv6", "ENCAPSULATE",
-            f"Encapsulating {what}: Next Header={next_header}")
+        log(self, "IPv6", "ENCAPSULATE", f"Encapsulating {what}: Next Header={next_header}")
         frame_type = FRAME_CONTROL if next_header == NH_ICMPV6 else FRAME_DATA
         log(self, "IPv6", "SEND", f"Passing IPv6 packet ({len(packet)} B) to MAC, next-hop MAC={next_hop_mac}")
         self.send_mac(next_hop_mac, frame_type, packet)
 
-    def receive_ipv6(self, packet: bytes, src_mac):
+    def receive_ipv6(self, packet: bytes, src_mac: str) -> None:
         """Parse IPv6 header, check destination, pass payload to the next layer."""
         if len(packet) < IPV6_HEADER_LEN:
             log(self, "IPv6", "DROP", "Packet shorter than IPv6 header; discarded")
@@ -202,13 +241,17 @@ class Node:
         src, dst = bytes_to_ip(src_b), bytes_to_ip(dst_b)
         payload = packet[IPV6_HEADER_LEN:IPV6_HEADER_LEN + plen]
         nh_name = NH_NAMES.get(nh, str(nh))
-        log(self, "IPv6", "PARSE",
-            f"Parsing IPv6 packet: src={src}, dst={dst}, Next Header={nh} ({nh_name}), payload_len={plen}")
+        log(
+            self,
+            "IPv6",
+            "PARSE",
+            f"Parsing IPv6 packet: src={src}, dst={dst}, Next Header={nh} ({nh_name}), payload_len={plen}",
+        )
 
-        is_me = ipaddress.IPv6Address(dst) == ipaddress.IPv6Address(self.ipv6)
-        is_rpl_mcast = ipaddress.IPv6Address(dst) == ipaddress.IPv6Address(RPL_ALL_NODES)
+        dst_obj = ipaddress.IPv6Address(dst)
+        is_me = dst_obj == self.ipv6_obj
+        is_rpl_mcast = dst_obj == ipaddress.IPv6Address(RPL_ALL_NODES)
         if not (is_me or is_rpl_mcast):
-            # Forwarding is added in later parts (routing via RPL parent / downward routes)
             log(self, "IPv6", "DROP", f"Destination {dst} is not this node; forwarding not implemented yet")
             return
 
@@ -221,26 +264,35 @@ class Node:
             log(self, "IPv6", "DROP", f"Unsupported Next Header={nh}; discarded")
 
     # ============================================================ RPL layer
-    def send_rpl(self, code=RPL_CODE_DIO):
+    def send_rpl(self, code: int = RPL_CODE_DIO) -> None:
         """Create an ICMPv6 RPL control message (DIO) and send it via IPv6."""
         if code != RPL_CODE_DIO:
             log(self, "RPL", "DROP", f"Unsupported RPL control code {code}")
             return
         log(self, "RPL", "CREATE", f"Creating DIO: Rank={fmt_rank(self.rank)}")
         msg = struct.pack(ICMP_RPL_FMT, ICMP_TYPE_RPL, code, self.rank)
-        log(self, "RPL", "ENCAPSULATE",
+        log(
+            self,
+            "RPL",
+            "ENCAPSULATE",
             f"ICMPv6 RPL control message: Type={ICMP_TYPE_RPL}, Code={code} (DIO), "
-            f"Rank={fmt_rank(self.rank)} ({len(msg)} B)")
+            f"Rank={fmt_rank(self.rank)} ({len(msg)} B)",
+        )
         self.send_ipv6(RPL_ALL_NODES, NH_ICMPV6, msg, BROADCAST_MAC)
 
-    def receive_rpl(self, msg: bytes, src_ipv6):
+    def receive_rpl(self, msg: bytes, src_ipv6: str) -> None:
         """Parse an ICMPv6 RPL control message; process DIO and update rank/parent."""
         if len(msg) < ICMP_RPL_LEN:
             log(self, "RPL", "DROP", "Message shorter than ICMPv6 RPL header; discarded")
             return
         mtype, code, adv_rank = struct.unpack(ICMP_RPL_FMT, msg[:ICMP_RPL_LEN])
         sender = self.channel.name_of_ipv6(src_ipv6)
-        log(self, "RPL", "PARSE", f"ICMPv6 message: Type={mtype}, Code={code}, Rank={fmt_rank(adv_rank)}")
+        log(
+            self,
+            "RPL",
+            "PARSE",
+            f"ICMPv6 message: Type={mtype}, Code={code}, Rank={fmt_rank(adv_rank)}",
+        )
         if mtype != ICMP_TYPE_RPL or code != RPL_CODE_DIO:
             log(self, "RPL", "DROP", f"Not an RPL DIO (Type={mtype}, Code={code}); ignored")
             return
@@ -264,18 +316,22 @@ class Node:
             log(self, "RPL", "PROCESS", f"Setting Preferred Parent={sender}")
             self.send_rpl(RPL_CODE_DIO)          # advertise the new rank to neighbours
         else:
-            log(self, "RPL", "PROCESS",
+            log(
+                self,
+                "RPL",
+                "PROCESS",
                 f"Candidate Rank={candidate} is not better than current Rank={fmt_rank(self.rank)}; "
-                f"keeping Preferred Parent={self.preferred_parent}")
+                f"keeping Preferred Parent={self.preferred_parent}",
+            )
 
-    def start_rpl(self):
+    def start_rpl(self) -> None:
         """Root starts topology construction by broadcasting the first DIO."""
         if self.is_root:
             self.send_rpl(RPL_CODE_DIO)
 
 
 # ---------------------------------------------------------------- topology
-def build_network():
+def build_network() -> Dict[str, Node]:
     ch = Channel()
     nodes = {
         "A": Node("A", "00:00:00:01", "fd00::1", ["B", "C"], ch, is_root=True, has_wired=True),
@@ -287,13 +343,13 @@ def build_network():
     return nodes
 
 
-def print_topology(nodes):
+def print_topology(nodes: Dict[str, Node]) -> None:
     print("\n=== RPL topology (DODAG) ===")
     for n in nodes.values():
         print(f"Node {n.name}: Rank={fmt_rank(n.rank)}, Preferred Parent={n.preferred_parent}")
 
 
-def main():
+def main() -> None:
     nodes = build_network()
 
     print("=== Node setup ===")
