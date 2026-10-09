@@ -5,45 +5,48 @@
 
 ## 1. Overview
 
-`iot_sim.py` is a single-file IoT network simulator that demonstrates a complete low-power protocol stack: **IEEE 802.15.4 MAC → IPv6 → RPL → UDP → CoAP → IPsec ESP → DTLS**. It shows end-to-end communication between an IoT node and a CoAP server, including encapsulation, decapsulation, routing, encryption, integrity checking, and replay protection.
+`iot_sim.py` is a single-file IoT network simulator implementing **IEEE 802.15.4 MAC, IPv6/RPL, UDP/CoAP, IPsec ESP, and DTLS**. It demonstrates end-to-end communication between an IoT node and a CoAP server, including encapsulation, decapsulation, routing, encryption, integrity checking, and replay protection.
 
-The topology is fixed: five nodes A–E (A is the RPL root and Internet gateway) plus a CoAP server attached to A via a wired interface. The encapsulation order on the sender side is:
+The topology is fixed: five nodes A–E, where A is the RPL root and Internet gateway, plus a CoAP server connected to A by a wired interface.
+
+For Part D, the sender encapsulates data in this order:
 
 **CoAP → DTLS → UDP → IPsec ESP → IPv6 → MAC**
 
-and the receiver reverses this, performing decapsulation and integrity checks at each layer.
+The receiver reverses the process, verifying integrity and replay state before passing data to the next layer.
 
 ---
 
 ## 2. File Organisation
 
-| Section | Purpose |
+| File / Section | Purpose |
 |---|---|
-| Header docstring | Describes the file and which parts it implements. |
-| Constants block | MAC/IPv6/UDP/CoAP/ESP/DTLS field formats, frame types, next-header values, ports, and keys. |
-| Helpers | `mac_to_bytes`, `ip_to_bytes`, `bytes_to_mac`, `bytes_to_ip`, `fmt_rank`, `log`. |
-| `Channel` class | Idealised wireless medium: one-hop unicast and broadcast delivery. |
+| `iot_sim.py` header | Identifies Parts A–D implemented by the simulator. |
+| Constants block | MAC/IPv6/UDP/CoAP/ESP/DTLS field formats, ports, keys and next-header values. |
+| Helpers | Address conversion, logging, AES-CBC, HMAC-SHA256 and replay-window helpers. |
+| `Channel` class | Idealised one-hop wireless unicast/broadcast delivery. |
 | `Node` class | Full protocol stack for nodes A–E. |
-| `CoAPServer` class | Internet-side server (IPv6/UDP/CoAP/IPsec/DTLS). |
-| Topology builder | `build_network()`, `print_topology()`. |
-| `main()` | Entry point: init → RPL → prompt for part (C/D) → prompt for source node. |
-
-Constants live at the top, helpers next, then the three classes, then the driver — a conventional, readable structure.
+| `CoAPServer` class | Internet-side IPv6/UDP/CoAP/IPsec/DTLS server. |
+| Topology / `main()` | Builds the network, runs RPL, then prompts for Part C/D and source node A–E. |
+| `requirements.txt` | Pins `cryptography==47.0.0` for AES-CBC support. |
 
 ---
 
 ## 3. Main Components
 
-### 3.1 `log()`
-Produces uniform lines `[Node X][PROTOCOL][OP] message`, satisfying the rubric's logging requirement. The server uses the same format.
+### 3.1 Logging
+
+Node logging uses `log()` and prints lines in the form `[Node X][PROTOCOL][OP] message`. The server prints the equivalent `[Server][PROTOCOL][OP]` format directly.
 
 ### 3.2 `Channel`
-Models an idealised wireless medium (no collisions/CSMA/CA). Delivers frames to one-hop neighbours and queues them so each node finishes processing before the next frame is delivered.
+
+Models an idealised wireless medium with no collisions or CSMA/CA. Frames are delivered only to one-hop neighbours and queued so processing remains deterministic.
 
 ### 3.3 `Node`
-Stores identity (`name`, `mac`, `ipv6`, `neighbors`), MAC state (`mac_seq`, `pending_acks`), RPL state (`rank`, `preferred_parent`, `parent_mac`), and security state (`ipsec_seq`, `dtls_seq`, replay windows, keys).
 
-Each layer is a symmetric send/receive pair:
+Stores identity (`name`, `mac`, `ipv6`, `neighbors`), MAC state (`mac_seq`, `pending_acks`), RPL state (`rank`, `preferred_parent`, `parent_mac`) and Part D security state (`ipsec_seq`, `dtls_seq`, ESP/DTLS replay windows). The preconfigured IPsec and DTLS keys are module-level constants shared by the simulator endpoints.
+
+Each layer uses send/receive functions:
 
 | Layer | Send | Receive |
 |---|---|---|
@@ -53,41 +56,44 @@ Each layer is a symmetric send/receive pair:
 | IPsec ESP | `send_ipsec()` | `receive_ipsec()` |
 | UDP | `send_udp()` | `receive_udp()` |
 | DTLS | `send_dtls()` | `receive_dtls()` |
-| CoAP | `send_coap()` | `receive_coap_response()` |
+| CoAP | `send_coap()` | `receive_coap()` |
 
 **Key behaviours:**
-- MAC: 12-byte header, ACK for unicast DATA, no ACK for broadcast.
-- IPv6: 35-byte header, next-header dispatch (58 ICMPv6, 17 UDP, 50 ESP, 59 none), forwarding at intermediate nodes with unchanged source/destination IPv6.
-- RPL: DIO broadcasts (Type=155, Code=1, Rank), candidate rank = advertised + 1, preferred-parent selection, re-broadcast on update.
-- IPsec ESP: Transport Mode with SPI, sequence number, IV, AES-128-CBC, HMAC-SHA-256, replay window.
-- DTLS: Record with Type/Version/Epoch/Seq/Length, AES-128-CBC, HMAC-SHA-256, separate keys and replay window.
-- UDP: 8-byte header; forwards to DTLS when security is active, otherwise to CoAP.
-- CoAP: 4-byte fixed header + Token + Uri-Path `/temperature` + payload; server replies with piggybacked ACK 2.04 Changed.
+- **MAC:** 12-byte header, ACK for unicast DATA, no ACK for broadcast.
+- **IPv6:** 35-byte simplified header; Next Header 58=ICMPv6, 17=UDP, 50=ESP, 59=none; intermediate forwarding preserves IPv6 source/destination addresses.
+- **RPL:** DIO broadcasts use Type 155, Code 1 and Rank; candidate rank = advertised rank + 1; nodes choose a preferred parent and re-advertise when rank improves.
+- **IPsec ESP:** SPI `0x00000001`, 32-bit sequence number, 16-byte IV, AES-128-CBC, HMAC-SHA256, ESP Next Header 17 and a 64-packet replay window. The complete UDP datagram is protected.
+- **DTLS:** simplified record with Type, Version, Epoch, 6-byte Sequence and Length; AES-128-CBC, HMAC-SHA256, independent sequence/replay state and separate keys.
+- **UDP:** 8-byte header; secure payloads are passed to DTLS, while Part C payloads go directly to CoAP. Destination ports are validated.
+- **CoAP:** CON POST to `/temperature` with payload `24°C`; the server returns a piggybacked ACK carrying `2.04 Changed`.
 
-Two routing helpers: `find_downward_next_hop()` walks up from the destination to find the next hop downward; the upward path uses `self.parent_mac`.
+`find_downward_next_hop()` walks upward from the destination through preferred-parent links to determine the correct child hop for downward RPL forwarding. Upward traffic uses `self.parent_mac`.
 
 ### 3.4 `CoAPServer`
-Standalone object reachable only through A's wired interface. Implements matching receive/build functions for IPv6, IPsec, UDP, DTLS, and CoAP, and maintains its own sequence counters and replay windows.
+
+The server is reachable through A's wired interface. It receives IPv6 traffic, dispatches UDP or ESP, validates/decrypts secure traffic, applies replay protection, parses CoAP requests, and generates both plain Part C and protected Part D responses. It maintains independent ESP and DTLS sequence counters and replay windows.
 
 ---
 
 ## 4. CoAP Message ID and Token
 
-- **Message ID = `1001`.** Operates at the CoAP *message layer* for duplicate detection and matching ACK/RST to CON. The server copies it into the piggybacked ACK.
-- **Token = `0xA1B2`.** Operates at the *request/response layer*. Echoed unchanged by the server so the client can match responses to requests independently of the message layer.
-- **Piggybacked ACK.** The server sends a single ACK carrying `2.04 Changed`, the same Message ID, and the same Token — satisfying both reliability and matching in one message, as described in Lecture 6.
+- **Message ID = `1001`:** used at the CoAP message layer to match the ACK to the original CON request.
+- **Token = `0xA1B2`:** echoed unchanged by the server so the client can match the response to the request.
+- **Piggybacked ACK:** a single ACK carries `2.04 Changed`, the same Message ID and the same Token.
 
 ---
 
 ## 5. Packet Flow
 
-**Upward (D → Server):**
+**Secure upward path (Node D → Server):**
+
 `CoAP → DTLS → UDP → IPsec ESP → IPv6 (NH=50) → MAC (D→B) → MAC (B→A) → wired → Server`
 
-**Downward (Server → D):**
-`Server → wired → A → B → D`
+**Secure downward path (Server → Node D):**
 
-IPv6 source/destination stay unchanged across hops; MAC addresses are rewritten hop-by-hop.
+`CoAP ACK → DTLS → UDP → IPsec ESP → IPv6 (NH=50) → wired → A → MAC (A→B) → MAC (B→D) → ESP → UDP → DTLS → CoAP`
+
+For Part C, CoAP is carried directly inside UDP without DTLS or ESP. IPv6 source/destination addresses remain unchanged across wireless hops while MAC addresses are rewritten hop-by-hop.
 
 ---
 
@@ -99,8 +105,7 @@ IPv6 source/destination stay unchanged across hops; MAC addresses are rewritten 
 | Part B | Allocated | — |
 | Part C | — | Allocated |
 | Part D | — | Allocated |
-| main() | Both | Both |
+| `main()` | Both | Both |
 | Documentation, testing & comments | Both | Both |
 
 ---
-
